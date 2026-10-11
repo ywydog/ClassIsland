@@ -18,7 +18,6 @@ on:
         type: boolean
 
 env:
-  PDC_CLIENT_VERSION: 1.0.1.0
   DOTNET_SDK_VERSION: 10.0.302
   MACOS_XCODE_PATH: /Applications/Xcode_26.6.app/Contents/Developer
 
@@ -97,9 +96,6 @@ jobs:
           buildType: ${{ matrix.build_type }}
           package: ${{ matrix.package }}
           is_release: ${{ startsWith(github.ref, 'refs/tags/') }}
-          test_signing_key: ${{ secrets.TEST_SIGNING_KEY }}
-          ApiSigningKey: ${{ secrets.API_SIGNING_KEY}}
-          ApiSigningKeyPs: ${{ secrets.API_SIGNING_KEY_PS }}
           arch: ${{ matrix.arch }}
           osName: ${{ matrix.os }}
           appVersion: ${{ steps.tagName.outputs.tag }} 
@@ -162,22 +158,8 @@ jobs:
       - uses: little-core-labs/get-git-tag@v3.0.1
         id: tagName
 
-      - name: Decode Android keystore
-        shell: bash
+      - name: Build Android APK
         env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/classisland.keystore"
-          test -s "$RUNNER_TEMP/classisland.keystore"
-
-      - name: Build and sign Android APK
-        env:
-          AndroidKeyStore: true
-          AndroidSigningKeyStore: ${{ runner.temp }}/classisland.keystore
-          AndroidSigningStorePass: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          AndroidSigningKeyPass: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          AndroidSigningKeyAlias: ${{ vars.ANDROID_KEY_ALIAS }}
           appVersion: ${{ steps.tagName.outputs.tag }}
           arch: ${{ matrix.arch }}
           osName: android
@@ -186,26 +168,6 @@ jobs:
           buildName: app
           isProductionBuild: ${{ github.event.inputs.release_tag && github.event_name != 'pull_request' && github.event.inputs.is_test_mode != 'true' }}
         run: ./build.sh PublishAndroidApp
-
-      - name: Verify Android APK signature
-        shell: bash
-        env:
-          EXPECTED_APPLICATION_ID: ${{ github.event.inputs.release_tag && github.event_name != 'pull_request' && github.event.inputs.is_test_mode != 'true' && 'cn.classisland.android' || 'cn.classisland.android.beta' }}
-        run: |
-          set -euo pipefail
-          APK_PATH="$(find ./out -maxdepth 1 -type f -name '*.apk' -print -quit)"
-          test -n "$APK_PATH"
-          APKSIGNER_PATH="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner -print | sort -V | tail -n 1)"
-          test -n "$APKSIGNER_PATH"
-          "$APKSIGNER_PATH" verify --verbose "$APK_PATH"
-          AAPT_PATH="$(find "$ANDROID_HOME/build-tools" -type f -name aapt -print | sort -V | tail -n 1)"
-          test -n "$AAPT_PATH"
-          "$AAPT_PATH" dump badging "$APK_PATH" | grep -F "package: name='$EXPECTED_APPLICATION_ID'"
-
-      - name: Remove Android keystore
-        if: ${{ always() }}
-        shell: bash
-        run: rm -f "$RUNNER_TEMP/classisland.keystore"
 
       - name: Upload Android APK to artifacts
         uses: actions/upload-artifact@v4
@@ -280,65 +242,9 @@ jobs:
           path: |
             ./out/*.zip
             
-  sign_1:
-    name: Sign_1
-    runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.release_tag && github.event_name != 'pull_request' && github.event.inputs.is_test_mode != 'true' }}
-    needs: [ build_app, build_launcher ]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          submodules: recursive
-          ref: ${{ github.event_name != 'workflow_dispatch' && github.ref || github.event.inputs.release_tag }}
-          
-      - name: Get commit hash
-        uses: prompt/actions-commit-hash@v3
-        id: commit
-        with:
-          prefix: "${{ github.event.inputs.release_tag }}+"
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./out_artifacts
-
-      - name: Create Sign Bundle
-        run: |
-          pwsh -ep Bypass -c ./tools/release-gen/create-sign-bundle.ps1
-
-      - name: Upload Sign Bundle to artifacts
-        id: upload-sign-bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: sign-bundle
-          path: ./ci_tmp/sign_bundle/*
-        
-      - name: Sign Application
-        uses: signpath/github-action-submit-signing-request@v1
-        with:
-          api-token: '${{ secrets.SIGNPATH_TOKEN }}'
-          organization-id: '74962648-db7a-4a10-bfdd-0637542e39df'
-          project-slug: 'ClassIsland'
-          artifact-configuration-slug: 'sign_bundle_v2'
-          signing-policy-slug: release-signing
-          github-artifact-id: '${{ steps.upload-sign-bundle.outputs.artifact-id }}'
-          wait-for-completion: true
-          output-artifact-directory: './out_signed'
-          parameters: |
-            version: ${{ toJSON(steps.commit.outputs.long) }}
-            
-      - name: Upload Signed Files to artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: signed_artifacts
-          path: ./out_signed/*
-            
   pack_app:
     runs-on: ${{ matrix.os == 'windows' && 'windows-2022' || 'ubuntu-latest' }}
-    needs: [ sign_1 ]
-    if: ${{ always() && success('build_app') && success('build_launcher') }}
+    needs: [ build_app, build_launcher ]
     env:
       build_id: app_${{ matrix.os }}_${{ matrix.arch }}_${{ matrix.build_type }}_${{ matrix.package }}
       artifact_name: out_app_${{ matrix.os }}_${{ matrix.arch }}_${{ matrix.build_type }}_${{ matrix.package }}
@@ -406,70 +312,12 @@ jobs:
             ${{ github.workspace }}/out_pack/*.zip
             ${{ github.workspace }}/out_pack/*.exe
           
-  build_nupkg:
-    runs-on: windows-2022
-    env:
-      Solution_Name: ClassIsland.sln
-      Wap_Project_Directory: ClassIsland/ClassIsland
-      Wap_Project_Path: ClassIsland/ClassIsland/ClassIsland.csproj
-    name: Build Nuget Packages
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          submodules: recursive
-          ref: ${{ github.event_name != 'workflow_dispatch' && github.ref || github.event.inputs.release_tag }} 
-
-      - name: List files
-        run: ls
-
-      - name: Install .NET Core
-        uses: actions/setup-dotnet@v3
-        with:
-          dotnet-version: ${{ env.DOTNET_SDK_VERSION }}
-
-      - name: Pin .NET SDK
-        shell: bash
-        run: |
-          # setup-dotnet installs the SDK but does not override global.json selection.
-          dotnet new globaljson --sdk-version "$DOTNET_SDK_VERSION" --roll-forward disable --force
-          dotnet --info
-          test "$(dotnet --version)" = "$DOTNET_SDK_VERSION"
-
-      - name: Setup MSBuild.exe
-        uses: microsoft/setup-msbuild@v1.0.2
-        
-      - name: Build Nuget packages
-        env:
-          is_release: ${{ startsWith(github.ref, 'refs/tags/') }}
-        run: |
-          ls
-          ./build.ps1 BuildNupkg --isRelease $env:is_release
-      
-      - name: Upload Nuget packages to GitHub registry
-        if: ${{ github.event_name != 'pull_request' }} 
-        env:
-          GHPKG_KEY: ${{ secrets.GITHUB_TOKEN }}
-          MYGET_ORG_KEY: ${{ secrets.MYGET_ORG_KEY }}
-        run: |
-          dotnet nuget add source --username github-actions --password $env:GHPKG_KEY --store-password-in-clear-text --name github "https://nuget.pkg.github.com/ClassIsland/index.json"
-          dotnet nuget push .\out\package\release\*.nupkg -k $env:GHPKG_KEY --source "github" --skip-duplicate
-          dotnet nuget push .\out\package\release\*.nupkg -k $env:MYGET_ORG_KEY --source https://www.myget.org/F/classisland/api/v3/index.json --skip-duplicate
-
-      - name: Upload Nuget Packages to artifacts
-        if: ${{ !matrix.trim_assets }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: out_nupkgs
-          path: ./out/package/release/*.nupkg
-
   publish:
     runs-on: ubuntu-latest
-    env:
-      isTestMode: ${{ github.event.inputs.is_test_mode == 'true' }}
-    if: ${{ always() && success('pack_app') && success('build_nupkg') && success('build_android') && github.event.inputs.release_tag && github.event_name != 'pull_request' }}
-    needs: [ pack_app, build_nupkg, build_android ]
+    if: ${{ always() && success() && github.event.inputs.release_tag && github.event_name != 'pull_request' }}
+    needs: [ pack_app, build_android ]
+    permissions:
+      contents: write
     concurrency:
       group: "publish-public"
     environment:
@@ -487,46 +335,15 @@ jobs:
         with:
           path: ./out_artifacts
 
-      - name: Install SSH key
-        uses: shimataro/ssh-key-action@v2
-        with:
-          key: ${{ secrets.METADATA_DEPLOY_KEY }}
-          known_hosts: ${{ secrets.SSH_KNOWN_HOSTS }}
-
-      - name: Publish App
+      - name: Init Artifacts
         shell: pwsh
-        env:
-          S3_Bucket: ${{ vars.S3_BUCKET }}
-          S3_Endpoint: ${{ vars.S3_ENDPOINT }}
-          S3_Region: ${{ vars.S3_REGION }}
-          PDC_Endpoint: ${{ vars.PDC_ENDPOINT }}
-          PDC_SigningKey: ${{ secrets.PDC_SigningKey }}
-          PDC_SigningKeyPs: ""
-          PDC_Token: ${{ secrets.PDC_TOKEN }}
-          S3_AccessKey: ${{ secrets.S3_ACCESSKEY }}
-          S3_SecretKey: ${{ secrets.S3_SECRETKEY }}
-          PDCC_version: ${{ github.event.inputs.release_tag }}
-          PDCC_primaryVersion: ${{ github.event.inputs.primary_version }}
-        run: |
-          ./tools/release-gen/init-artifacts.ps1
-          ./tools/release-gen/install-pdcc.ps1 linux
-          ./pdcc/PhainonDistributionCenter.Client ./phainon.yml Publish ${{ github.event.inputs.primary_version }} ${{ github.event.inputs.release_tag }} ./out
-          
+        run: ./tools/release-gen/init-artifacts.ps1
+
       - name: Upload APP to release
         uses: ncipollo/release-action@v1
         with:
           artifacts: "./out/*.zip,./out/*.appx,./out/*.deb,./out/*.pkg,./out/*.apk"
           draft: true
-          bodyFile: ./out/ChangeLogs.md
+          bodyFile: ./doc/ChangeLogs/${{ github.event.inputs.primary_version }}/${{ github.event.inputs.release_tag }}/App.md
           token: ${{ secrets.GITHUB_TOKEN }}
           tag: ${{ github.event_name != 'workflow_dispatch' && github.ref || github.event.inputs.release_tag }} 
-          
-      - name: Upload Nuget packages to NuGet Gallery
-        if: ${{ github.event_name != 'pull_request' && github.event.inputs.is_test_mode != 'true' }}
-        shell: pwsh
-        env:
-          NUGET_KEY: ${{ secrets.NUGET_ORG_KEY }}
-        run: |
-          ls
-          cd out_artifacts/out_nupkgs
-          dotnet nuget push *.nupkg -k $env:NUGET_KEY -s https://api.nuget.org/v3/index.json --skip-duplicate
